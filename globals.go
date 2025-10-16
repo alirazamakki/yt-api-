@@ -51,6 +51,20 @@ var (
 
     // Context for graceful shutdown
     ctx, cancel = context.WithCancel(context.Background())
+
+    // Conversion sessions: in-memory state store
+    sessions = struct {
+        sync.RWMutex
+        m map[string]*ConversionSession
+    }{m: make(map[string]*ConversionSession)}
+
+    // Concurrency limiters for session-based prepare/convert flows
+    downloadSlots chan struct{}
+    convertSlots  chan struct{}
+
+    // Circuit breakers for external metadata endpoints
+    oembedBreaker   = NewCircuitBreaker(5, 30*time.Second)
+    durationBreaker = NewCircuitBreaker(5, 30*time.Second)
 )
 
 // Waiters notified when a job reaches a terminal state (completed or failed).

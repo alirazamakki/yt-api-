@@ -75,6 +75,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
         "failed_jobs":          atomic.LoadInt64(&failedJobs),
         "success_rate":         calculateSuccessRate(),
         "avg_processing_time":  getAvgProcessingTime(),
+        "sessions_active":      func() int { sessions.RLock(); defer sessions.RUnlock(); return len(sessions.m) }(),
     }
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(stats)
@@ -96,7 +97,27 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
         http.Error(w, "Missing job ID", http.StatusBadRequest)
         return
     }
-    // Load job from memory or Redis if available
+    // First, check new session-based flow
+    sessions.Lock()
+    if sess, ok := sessions.m[jobID]; ok && sess != nil {
+        // Avoid deleting during an active conversion (best-effort)
+        if sess.State == StateConverting || sess.State == StateDownloading {
+            sessions.Unlock()
+            http.Error(w, "Operation in progress; try again later", http.StatusConflict)
+            return
+        }
+        if sess.OutputPath != "" { _ = os.Remove(sess.OutputPath); sess.OutputPath = "" }
+        if sess.SourcePath != "" { _ = os.Remove(sess.SourcePath); sess.SourcePath = "" }
+        delete(sessions.m, jobID)
+        deleteSessionFromRedis(jobID)
+        sessions.Unlock()
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "message": "Conversion data removed successfully."})
+        return
+    }
+    sessions.Unlock()
+
+    // Legacy job-based cleanup: Load job from memory or Redis if available
     var job *ConversionJob
     jobStore.RLock()
     j, exists := jobStore.jobs[jobID]
@@ -141,7 +162,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
     downloadTrackers.Unlock()
 
     w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(map[string]string{"deleted": jobID})
+    json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "message": "Conversion data removed successfully."})
 }
 
 // Prometheus exposition format metrics

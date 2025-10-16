@@ -205,6 +205,16 @@ YTDLP_EXTRACTOR_ARGS=$(read_with_default "YTDLP extractor args" "")
 echo "Cookies (browser:chrome | path to cookies.txt | blank)"
 YTDLP_COOKIES=$(read_with_default "YTDLP cookies" "")
 
+echo
+echo "=== Prepare/Convert Session Flow ==="
+CONVERSIONS_DIR=$(read_with_default "Conversions directory" "/tmp/conversions")
+UNCONVERTED_FILE_TTL=$(prompt_duration "Source file TTL (delete if no convert)" "5m")
+CONVERTED_FILE_TTL=$(prompt_duration "Converted MP3 TTL" "10m")
+MAX_CONCURRENT_DOWNLOADS=$(prompt_int "Max concurrent downloads" "20")
+MAX_CONCURRENT_CONVERSIONS=$(prompt_int "Max concurrent conversions" "20")
+OEMBED_ENDPOINT=$(read_with_default "oEmbed endpoint" "https://www.youtube.com/oembed")
+DURATION_API_ENDPOINT=$(read_with_default "Duration API endpoint" "https://ds2.ezsrv.net/api/getDuration")
+
 # Skip metadata fetch for fastest starts
 echo
 echo "=== Metadata Fetch ==="
@@ -373,6 +383,13 @@ BACKOFF_MAX_SECONDS=${BACKOFF_MAX_SECONDS}
 MAX_DURATION_MIN=${MAX_DURATION_MIN}
 ADMIN_USER='${ADMIN_USER}'
 ADMIN_PASS='${ADMIN_PASS}'
+CONVERSIONS_DIR='${CONVERSIONS_DIR}'
+UNCONVERTED_FILE_TTL='${UNCONVERTED_FILE_TTL}'
+CONVERTED_FILE_TTL='${CONVERTED_FILE_TTL}'
+MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS}
+MAX_CONCURRENT_CONVERSIONS=${MAX_CONCURRENT_CONVERSIONS}
+OEMBED_ENDPOINT='${OEMBED_ENDPOINT}'
+DURATION_API_ENDPOINT='${DURATION_API_ENDPOINT}'
 EOF
 chmod 0644 "${ENV_FILE}"
 

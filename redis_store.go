@@ -86,6 +86,62 @@ func deleteJobFromRedis(jobID string) {
     _ = redisClient.Del(ctx, key).Err()
 }
 
+// Session store (prepare/convert flow)
+func saveSessionToRedis(sess *ConversionSession) error {
+    if redisClient == nil || sess == nil {
+        return nil
+    }
+    key := fmt.Sprintf("sess:%s", sess.ID)
+    data, err := json.Marshal(sess)
+    if err != nil { return err }
+    return redisClient.Set(ctx, key, data, JobExpiration).Err()
+}
+
+func getSessionFromRedis(id string) (*ConversionSession, error) {
+    if redisClient == nil {
+        return nil, nil
+    }
+    key := fmt.Sprintf("sess:%s", id)
+    val, err := redisClient.Get(ctx, key).Result()
+    if err != nil { return nil, err }
+    var s ConversionSession
+    if err := json.Unmarshal([]byte(val), &s); err != nil { return nil, err }
+    return &s, nil
+}
+
+func deleteSessionFromRedis(id string) {
+    if redisClient == nil { return }
+    key := fmt.Sprintf("sess:%s", id)
+    _ = redisClient.Del(ctx, key).Err()
+}
+
+// Combined helpers to keep in-memory and Redis in sync
+func saveSession(sess *ConversionSession) {
+    if sess == nil { return }
+    sessions.Lock()
+    sessions.m[sess.ID] = sess
+    sessions.Unlock()
+    _ = saveSessionToRedis(sess)
+}
+
+func getSession(id string) (*ConversionSession, bool) {
+    sessions.RLock()
+    s, ok := sessions.m[id]
+    sessions.RUnlock()
+    if ok && s != nil { return s, true }
+    // Try Redis
+    if rs, err := getSessionFromRedis(id); err == nil && rs != nil {
+        sessions.Lock(); sessions.m[id] = rs; sessions.Unlock()
+        return rs, true
+    }
+    return nil, false
+}
+
+func deleteSession(id string) {
+    sessions.Lock(); delete(sessions.m, id); sessions.Unlock()
+    deleteSessionFromRedis(id)
+}
+
 func xxhashString(s string) uint64 {
     return xxhash.Sum64String(s)
 }

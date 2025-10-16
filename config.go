@@ -76,6 +76,21 @@ var (
 
     // Skip metadata (-J) and start immediately
     SkipMetadata = false
+
+    // Conversion sessions (prepare/convert flow)
+    // Base directory for temporary conversions (sources and outputs)
+    ConversionsDir = "/tmp/conversions"
+    // Auto-delete window for unconverted source files (no activity)
+    UnconvertedFileTTL = 5 * time.Minute
+    // Auto-delete window for converted MP3 files
+    ConvertedFileTTL = 10 * time.Minute
+    // External metadata sources
+    OEmbedEndpoint       = "https://www.youtube.com/oembed"
+    DurationAPIEndpoint  = "https://ds2.ezsrv.net/api/getDuration"
+
+    // Concurrency caps for session background operations
+    MaxConcurrentDownloads = 20
+    MaxConcurrentConversions = 20
 )
 
 func envInt(key string, def int) int {
@@ -171,4 +186,15 @@ func InitConfigFromEnv() {
 
     // Skip metadata
     SkipMetadata = envString("SKIP_METADATA", "false") == "true"
+
+    // Conversion sessions (prepare/convert flow)
+    ConversionsDir = envString("CONVERSIONS_DIR", ConversionsDir)
+    UnconvertedFileTTL = envDuration("UNCONVERTED_FILE_TTL", UnconvertedFileTTL)
+    ConvertedFileTTL = envDuration("CONVERTED_FILE_TTL", ConvertedFileTTL)
+    OEmbedEndpoint = envString("OEMBED_ENDPOINT", OEmbedEndpoint)
+    DurationAPIEndpoint = envString("DURATION_API_ENDPOINT", DurationAPIEndpoint)
+
+    // Concurrency caps for session background operations
+    MaxConcurrentDownloads = envInt("MAX_CONCURRENT_DOWNLOADS", MaxConcurrentDownloads)
+    MaxConcurrentConversions = envInt("MAX_CONCURRENT_CONVERSIONS", MaxConcurrentConversions)
 }
