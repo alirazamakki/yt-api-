@@ -1,8 +1,6 @@
-module ytmp3
+module ytmp3-api
 
-go 1.24.0
-
-toolchain go1.24.2
+go 1.21
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
