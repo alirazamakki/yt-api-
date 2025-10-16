@@ -165,6 +165,65 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
     }
 }
 
+// POST /metadata
+// Returns metadata quickly (1-2 seconds) and starts background audio download
+func handleMetadata(w http.ResponseWriter, r *http.Request) {
+    enableCORS(w, r)
+    if r.Method == http.MethodOptions { w.WriteHeader(http.StatusOK); return }
+    if r.Method != http.MethodPost { http.Error(w, "Invalid request method", http.StatusMethodNotAllowed); return }
+
+    var req PrepareRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil { 
+        http.Error(w, "Invalid JSON", http.StatusBadRequest); return 
+    }
+    if req.URL == "" || !isValidYouTubeURL(req.URL) { 
+        http.Error(w, "Invalid YouTube URL", http.StatusBadRequest); return 
+    }
+
+    // Canonicalize URL
+    if canon, ok := canonicalizeYouTubeURL(req.URL); ok { req.URL = canon }
+
+    // Generate unique session ID
+    convID := "meta_" + uuid.New().String()
+    
+    // Create session for tracking
+    sess := &ConversionSession{ 
+        ID: convID, 
+        URL: req.URL, 
+        State: StatePreparing, 
+        CreatedAt: time.Now(), 
+        UpdatedAt: time.Now(), 
+        LastActivityAt: time.Now(),
+    }
+
+    // Fetch metadata quickly using OEmbed + duration API (fastest approach)
+    sess.State = StateFetching
+    meta := MetaLite{}
+    title, author, thumb := fetchOEmbedMeta(req.URL)
+    durSec := fetchDurationSeconds(req.URL)
+    meta.Title = title
+    meta.Channel = author
+    meta.Duration = durSec
+    meta.Thumbnail = thumb
+    sess.Meta = meta
+
+    // Persist session
+    saveSession(sess)
+
+    // Start background download immediately (don't wait for response)
+    go startBackgroundAudioDownload(sess)
+
+    // Return metadata immediately (within 1-2 seconds)
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "conversion_id": convID,
+        "status": "metadata_ready",
+        "metadata": meta,
+        "message": "Metadata retrieved. Audio download started in background.",
+        "check_status_endpoint": fmt.Sprintf("http://localhost:8080/status/%s", convID),
+    })
+}
+
 // POST /prepare
 // Fetches basic metadata without yt-dlp and starts a background download of best audio
 func handlePrepare(w http.ResponseWriter, r *http.Request) {
@@ -496,7 +555,10 @@ func handleDocs(w http.ResponseWriter, r *http.Request) {
     <p>High-level guide for backend integration.</p>
     <h2>Endpoints</h2>
     <ul>
+      <li><code>POST /metadata</code> - Get metadata quickly (1-2s) + background audio download. Body: { url }</li>
       <li><code>POST /extract</code> - Start conversion. Body: { url, idempotency_key?, callback_url? }</li>
+      <li><code>POST /prepare</code> - Prepare conversion with metadata. Body: { url }</li>
+      <li><code>POST /convert</code> - Convert prepared audio. Body: { conversion_id, quality?, start_time?, end_time? }</li>
       <li><code>GET /status/{job_id}</code> - Check job status.</li>
       <li><code>GET /download/{job_id}.mp3</code> - Download MP3 (Range supported).</li>
       <li><code>GET /health</code>, <code>/metrics</code>, <code>/stats</code> - Monitoring.</li>
@@ -519,7 +581,18 @@ func handleDocsFrontend(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Content-Type", "text/html; charset=utf-8")
     io.WriteString(w, `<!doctype html><html><head><meta charset="utf-8"><title>Frontend Integration</title><style>body{font-family:sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;}</style></head><body>
     <h1>Frontend Integration</h1>
-    <p>Use fetch with CORS. Example:</p>
+    <p>Use fetch with CORS. Examples:</p>
+    <h3>Quick Metadata + Background Download:</h3>
+    <pre><code>fetch('/metadata',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':'YOUR_KEY'},body:JSON.stringify({url})})
+ .then(r=>r.json())
+ .then(({conversion_id,metadata})=>{
+   console.log('Title:', metadata.title);
+   console.log('Duration:', metadata.duration);
+   console.log('Thumbnail:', metadata.thumbnail);
+   // Poll status for download completion
+   pollStatus(conversion_id);
+ })</code></pre>
+    <h3>Traditional Extract:</h3>
     <pre><code>fetch('/extract',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':'YOUR_KEY'},body:JSON.stringify({url})})
  .then(r=>r.json())
  .then(({job_id})=>pollStatus(job_id))</code></pre>
