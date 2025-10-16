@@ -165,6 +165,112 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
     }
 }
 
+// POST /prepare
+// Fetches basic metadata without yt-dlp and starts a background download of best audio
+func handlePrepare(w http.ResponseWriter, r *http.Request) {
+    enableCORS(w, r)
+    if r.Method == http.MethodOptions { w.WriteHeader(http.StatusOK); return }
+    if r.Method != http.MethodPost { http.Error(w, "Invalid request method", http.StatusMethodNotAllowed); return }
+
+    var req PrepareRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil { http.Error(w, "Invalid JSON", http.StatusBadRequest); return }
+    if req.URL == "" || !isValidYouTubeURL(req.URL) { http.Error(w, "Invalid YouTube URL", http.StatusBadRequest); return }
+
+    // Canonicalize
+    if canon, ok := canonicalizeYouTubeURL(req.URL); ok { req.URL = canon }
+
+    convID := "conv_" + uuid.New().String()
+    sess := &ConversionSession{ ID: convID, URL: req.URL, State: StateCreated, CreatedAt: time.Now(), UpdatedAt: time.Now(), LastActivityAt: time.Now() }
+
+    // Fetch metadata via OEmbed + duration API
+    meta := MetaLite{}
+    title, author, thumb := fetchOEmbedMeta(req.URL)
+    durSec := fetchDurationSeconds(req.URL)
+    meta.Title = title
+    meta.Channel = author
+    meta.Duration = durSec
+    meta.Thumbnail = thumb
+    sess.Meta = meta
+
+    // Persist
+    sessions.Lock(); sessions.m[convID] = sess; sessions.Unlock()
+
+    // Start background download
+    go startBackgroundDownload(sess)
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(PrepareResponse{
+        ConversionID: convID,
+        Status: string(StateCreated),
+        Metadata: meta,
+        Message: "Metadata fetched successfully. Stream is downloading in background.",
+    })
+}
+
+// POST /convert
+func handleConvert(w http.ResponseWriter, r *http.Request) {
+    enableCORS(w, r)
+    if r.Method == http.MethodOptions { w.WriteHeader(http.StatusOK); return }
+    if r.Method != http.MethodPost { http.Error(w, "Invalid request method", http.StatusMethodNotAllowed); return }
+
+    var req ConvertRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil { http.Error(w, "Invalid JSON", http.StatusBadRequest); return }
+    if req.ConversionID == "" { http.Error(w, "Missing conversion_id", http.StatusBadRequest); return }
+    if req.Quality == "" { req.Quality = Quality320 }
+
+    sessions.RLock(); sess, ok := sessions.m[req.ConversionID]; sessions.RUnlock()
+    if !ok || sess == nil { http.Error(w, "Conversion not found", http.StatusNotFound); return }
+
+    // Enforce per-ID conversion limit
+    if sess.ConversionsCount >= 2 {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusTooManyRequests)
+        json.NewEncoder(w).Encode(map[string]string{"error": "Conversion limit reached for this ID."})
+        return
+    }
+
+    sess.Quality = req.Quality
+    sess.LastActivityAt = time.Now()
+
+    // If still downloading, queue for conversion
+    if sess.State == StateDownloading {
+        sess.State = StateQueued
+        sess.RequestedStart = req.StartTime
+        sess.RequestedEnd = req.EndTime
+        sess.UpdatedAt = time.Now()
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "conversion_id": sess.ID,
+            "status": string(StateQueued),
+            "message": "Stream is downloading. Conversion will start automatically.",
+        })
+        return
+    }
+
+    // If downloaded, start conversion immediately
+    if sess.State == StateDownloaded {
+        go startConversion(sess, req.StartTime, req.EndTime)
+        sess.State = StateConverting
+        sess.UpdatedAt = time.Now()
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "conversion_id": sess.ID,
+            "status": string(StateConverting),
+            "message": "Conversion started.",
+        })
+        return
+    }
+
+    // If already converting or completed, return state
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "conversion_id": sess.ID,
+        "status": string(sess.State),
+    })
+}
+
 func handleStatus(w http.ResponseWriter, r *http.Request) {
     enableCORS(w, r)
 
@@ -178,6 +284,34 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
         http.Error(w, "Missing job ID", http.StatusBadRequest)
         return
     }
+
+    // Prefer new conversion session if present
+    sessions.RLock()
+    if sess, ok := sessions.m[jobID]; ok && sess != nil {
+        sessions.RUnlock()
+        resp := map[string]interface{}{
+            "conversion_id": sess.ID,
+            "status": string(sess.State),
+        }
+        if sess.State == StateDownloading {
+            resp["download_progress"] = sess.DownloadProgress
+        }
+        if sess.State == StateConverting {
+            resp["conversion_progress"] = sess.ConversionProgress
+        }
+        if sess.State == StateCompleted && sess.OutputPath != "" {
+            resp["download_url"] = fmt.Sprintf("http://localhost:8080/download/%s.mp3", sess.ID)
+            resp["metadata"] = map[string]interface{}{
+                "title": sess.Meta.Title,
+                "duration": sess.Meta.Duration,
+                "quality": string(sess.Quality),
+            }
+        }
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(resp)
+        return
+    }
+    sessions.RUnlock()
 
     job, err := getJobFromRedis(jobID)
     if err != nil || job == nil {
@@ -228,6 +362,46 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
         return
     }
     jobID := filenameWithExt[:len(filenameWithExt)-len(".mp3")]
+
+    // New conversion session path
+    sessions.RLock()
+    if sess, ok := sessions.m[jobID]; ok && sess != nil && sess.State == StateCompleted && sess.OutputPath != "" {
+        path := sess.OutputPath
+        sessions.RUnlock()
+        file, err := os.Open(path)
+        if err != nil {
+            http.Error(w, "Error opening file", http.StatusInternalServerError)
+            return
+        }
+        defer file.Close()
+
+        fi, _ := file.Stat()
+        size := fi.Size()
+        w.Header().Set("Accept-Ranges", "bytes")
+        w.Header().Set("Content-Type", "audio/mpeg")
+        w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filenameWithExt))
+        w.Header().Set("Cache-Control", "public, max-age=3600")
+
+        if rng := r.Header.Get("Range"); rng != "" {
+            if strings.HasPrefix(rng, "bytes=") {
+                parts := strings.TrimPrefix(rng, "bytes=")
+                if strings.HasSuffix(parts, "-") {
+                    startStr := strings.TrimSuffix(parts, "-")
+                    if start, err := strconv.ParseInt(startStr, 10, 64); err == nil && start < size {
+                        w.WriteHeader(http.StatusPartialContent)
+                        w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, size-1, size))
+                        file.Seek(start, 0)
+                        io.Copy(w, file)
+                        return
+                    }
+                }
+            }
+        }
+        w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
+        io.Copy(w, file)
+        return
+    }
+    sessions.RUnlock()
 
     job, err := getJobFromRedis(jobID)
     if err != nil || job == nil {

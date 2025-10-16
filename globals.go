@@ -51,6 +51,12 @@ var (
 
     // Context for graceful shutdown
     ctx, cancel = context.WithCancel(context.Background())
+
+    // Conversion sessions: in-memory state store
+    sessions = struct {
+        sync.RWMutex
+        m map[string]*ConversionSession
+    }{m: make(map[string]*ConversionSession)}
 )
 
 // Waiters notified when a job reaches a terminal state (completed or failed).

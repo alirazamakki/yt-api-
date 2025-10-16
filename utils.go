@@ -1,8 +1,11 @@
 package main
 
 import (
+    "bytes"
+    "context"
     "log"
     "os"
+    "os/exec"
     "os/signal"
     "syscall"
     "runtime"
@@ -11,6 +14,8 @@ import (
     neturl "net/url"
     "time"
     "path/filepath"
+    "net/http"
+    "encoding/json"
 )
 
 func setupGracefulShutdown() {
@@ -172,6 +177,200 @@ func canonicalizeYouTubeURL(raw string) (string, bool) {
 func isValidYouTubeURL(raw string) bool {
     _, ok := extractYouTubeVideoID(raw)
     return ok
+}
+
+// External metadata helpers for /prepare
+func fetchOEmbedMeta(videoURL string) (title string, author string, thumbnail string) {
+    // YouTube oEmbed endpoint: title and thumbnail_url
+    reqURL := OEmbedEndpoint + "?format=json&url=" + neturl.QueryEscape(videoURL)
+    client := &http.Client{ Timeout: 8 * time.Second }
+    resp, err := client.Get(reqURL)
+    if err != nil { return "", "", "" }
+    defer resp.Body.Close()
+    var data struct{
+        Title string `json:"title"`
+        ThumbnailURL string `json:"thumbnail_url"`
+        AuthorName string `json:"author_name"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&data); err != nil { return "", "", "" }
+    return data.Title, data.AuthorName, data.ThumbnailURL
+}
+
+func fetchDurationSeconds(videoURL string) int {
+    // External duration API returns seconds as integer in JSON
+    reqURL := DurationAPIEndpoint + "?url=" + neturl.QueryEscape(videoURL)
+    client := &http.Client{ Timeout: 8 * time.Second }
+    resp, err := client.Get(reqURL)
+    if err != nil { return 0 }
+    defer resp.Body.Close()
+    var data struct{ Duration int `json:"duration"` }
+    if err := json.NewDecoder(resp.Body).Decode(&data); err != nil { return 0 }
+    return data.Duration
+}
+
+// Background download using yt-dlp bestaudio to ConversionsDir/{id}.{ext}
+func startBackgroundDownload(sess *ConversionSession) {
+    if sess == nil { return }
+    sess.State = StateDownloading
+    sess.UpdatedAt = time.Now()
+    sess.LastActivityAt = time.Now()
+    sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+
+    _ = os.MkdirAll(ConversionsDir, 0o755)
+    basePath := filepath.Join(ConversionsDir, sess.ID)
+
+    // Use yt-dlp to download; reuse existing helper with output template
+    tmpNoExt := basePath
+    // We do not have built-in progress callbacks for yt-dlp here; best effort
+    if err := downloadAudioWithYTDLP(sess.URL, tmpNoExt, ""); err != nil {
+        sess.State = StateFailed
+        sess.Error = err.Error()
+        sess.UpdatedAt = time.Now()
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        return
+    }
+    // Determine saved file extension
+    var srcPath string
+    for _, ext := range []string{"m4a","webm","mp4","opus","ogg"} {
+        p := tmpNoExt + "." + ext
+        if _, err := os.Stat(p); err == nil { srcPath = p; sess.SourceExt = ext; break }
+    }
+    if srcPath == "" { srcPath = tmpNoExt + ".m4a" }
+    sess.SourcePath = srcPath
+    // If a convert was queued meanwhile, kick it off
+    queued := false
+    sessions.Lock()
+    if s, ok := sessions.m[sess.ID]; ok && s != nil && s.State == StateQueued {
+        queued = true
+        s.State = StateDownloaded
+        s.SourcePath = sess.SourcePath
+        s.SourceExt = sess.SourceExt
+        s.UpdatedAt = time.Now()
+        sessions.m[sess.ID] = s
+        sess = s
+    } else {
+        sess.State = StateDownloaded
+        sess.UpdatedAt = time.Now()
+        sessions.m[sess.ID] = sess
+    }
+    sessions.Unlock()
+    if queued {
+        go startConversion(sess, sess.RequestedStart, sess.RequestedEnd)
+    }
+}
+
+// Start ffmpeg conversion to MP3 with optional trimming and quality
+func startConversion(sess *ConversionSession, startTime, endTime string) {
+    if sess == nil || sess.SourcePath == "" { return }
+    sess.State = StateConverting
+    sess.UpdatedAt = time.Now()
+    sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+
+    // Build ffmpeg args using convertStreamToMP3 helper by passing source path
+    outPath := filepath.Join(ConversionsDir, sess.ID+".mp3")
+    // Prepare a timeout based on metadata duration if available
+    var timeout time.Duration = FFmpegMinTimeout
+    if sess.Meta.Duration > 0 {
+        d := time.Duration(sess.Meta.Duration) * time.Second
+        calc := d*2 + 3*time.Minute
+        if calc > timeout { timeout = calc }
+        if timeout > FFmpegMaxTimeout { timeout = FFmpegMaxTimeout }
+    }
+
+    // Build quality override
+    prevCBR := FFmpegCBRBitrate
+    if sess.Quality != "" {
+        switch sess.Quality {
+        case Quality128: FFmpegCBRBitrate = "128k"
+        case Quality192: FFmpegCBRBitrate = "192k"
+        case Quality256: FFmpegCBRBitrate = "256k"
+        case Quality320: FFmpegCBRBitrate = "320k"
+        }
+    }
+    // Handle trim by constructing direct ffmpeg command when needed
+    if startTime != "" || endTime != "" {
+        // Custom command with -ss/-to then encode
+        // Reuse convertStreamToMP3 after we slice via input arguments
+        // For simplicity, run ffmpeg directly here
+        args := []string{"-y", "-loglevel", "error", "-nostdin"}
+        if startTime != "" { args = append(args, "-ss", startTime) }
+        args = append(args, "-i", sess.SourcePath)
+        if endTime != "" { args = append(args, "-to", endTime) }
+        args = append(args, "-vn", "-acodec", "libmp3lame", "-ar", "44100", "-b:a", string(FFmpegCBRBitrate), outPath)
+        deadline := time.Now().Add(timeout)
+        _ = runFFmpeg(args, deadline)
+    } else {
+        _ = convertStreamToMP3(sess.SourcePath, outPath, timeout)
+    }
+    // Restore global bitrate
+    FFmpegCBRBitrate = prevCBR
+
+    if _, err := os.Stat(outPath); err == nil {
+        sess.OutputPath = outPath
+        sess.State = StateCompleted
+        sess.ConversionsCount++
+        sess.UpdatedAt = time.Now()
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        // schedule deletion of MP3 after TTL
+        go func(id, path string){
+            time.Sleep(ConvertedFileTTL)
+            _ = os.Remove(path)
+            sessions.Lock()
+            if s, ok := sessions.m[id]; ok && s != nil && s.OutputPath == path { s.OutputPath = "" }
+            sessions.Unlock()
+        }(sess.ID, outPath)
+    } else {
+        sess.State = StateFailed
+        sess.Error = "ffmpeg conversion failed"
+        sess.UpdatedAt = time.Now()
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+    }
+}
+
+func runFFmpeg(args []string, deadline time.Time) error {
+    // Simple wrapper that enforces timeout
+    d := time.Until(deadline)
+    if d <= 0 { d = FFmpegMinTimeout }
+    ctxTimeout, cancel := context.WithTimeout(ctx, d)
+    defer cancel()
+    cmd := exec.CommandContext(ctxTimeout, "ffmpeg", args...)
+    var stderr bytes.Buffer
+    cmd.Stderr = &stderr
+    if err := cmd.Run(); err != nil {
+        return fmt.Errorf("ffmpeg error: %v | %s", err, strings.TrimSpace(stderr.String()))
+    }
+    return nil
+}
+
+// Periodic cleanup for unconverted source files
+func startSessionCleaner() {
+    ticker := time.NewTicker(1 * time.Minute)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ticker.C:
+            now := time.Now()
+            sessions.Lock()
+            for id, s := range sessions.m {
+                if s == nil { continue }
+                if s.OutputPath == "" && s.SourcePath != "" && now.Sub(s.LastActivityAt) > UnconvertedFileTTL {
+                    _ = os.Remove(s.SourcePath)
+                    s.SourcePath = ""
+                    if s.State == StateDownloading || s.State == StateDownloaded || s.State == StateQueued {
+                        s.State = StateFailed
+                        s.Error = "expired due to inactivity"
+                    }
+                }
+                // Remove whole session if fully cleaned up and old
+                if s.OutputPath == "" && s.SourcePath == "" && now.Sub(s.UpdatedAt) > 30*time.Minute {
+                    delete(sessions.m, id)
+                }
+            }
+            sessions.Unlock()
+        case <-ctx.Done():
+            return
+        }
+    }
 }
 
 // Schedules deletion 10 minutes after completion unless an active download is in progress.
