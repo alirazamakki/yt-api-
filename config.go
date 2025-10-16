@@ -87,6 +87,10 @@ var (
     // External metadata sources
     OEmbedEndpoint       = "https://www.youtube.com/oembed"
     DurationAPIEndpoint  = "https://ds2.ezsrv.net/api/getDuration"
+
+    // Concurrency caps for session background operations
+    MaxConcurrentDownloads = 20
+    MaxConcurrentConversions = 20
 )
 
 func envInt(key string, def int) int {
@@ -189,4 +193,8 @@ func InitConfigFromEnv() {
     ConvertedFileTTL = envDuration("CONVERTED_FILE_TTL", ConvertedFileTTL)
     OEmbedEndpoint = envString("OEMBED_ENDPOINT", OEmbedEndpoint)
     DurationAPIEndpoint = envString("DURATION_API_ENDPOINT", DurationAPIEndpoint)
+
+    // Concurrency caps for session background operations
+    MaxConcurrentDownloads = envInt("MAX_CONCURRENT_DOWNLOADS", MaxConcurrentDownloads)
+    MaxConcurrentConversions = envInt("MAX_CONCURRENT_CONVERSIONS", MaxConcurrentConversions)
 }

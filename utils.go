@@ -211,6 +211,18 @@ func fetchDurationSeconds(videoURL string) int {
 // Background download using yt-dlp bestaudio to ConversionsDir/{id}.{ext}
 func startBackgroundDownload(sess *ConversionSession) {
     if sess == nil { return }
+    // Acquire download slot (drop if saturated to protect server)
+    select {
+    case downloadSlots <- struct{}{}:
+        defer func(){ <-downloadSlots }()
+    default:
+        // Too many concurrent downloads; mark failed quickly to keep API responsive
+        sess.State = StateFailed
+        sess.Error = "server busy; too many concurrent downloads"
+        sess.UpdatedAt = time.Now()
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        return
+    }
     sess.State = StateDownloading
     sess.UpdatedAt = time.Now()
     sess.LastActivityAt = time.Now()
@@ -262,6 +274,18 @@ func startBackgroundDownload(sess *ConversionSession) {
 // Start ffmpeg conversion to MP3 with optional trimming and quality
 func startConversion(sess *ConversionSession, startTime, endTime string) {
     if sess == nil || sess.SourcePath == "" { return }
+    // Acquire conversion slot
+    select {
+    case convertSlots <- struct{}{}:
+        defer func(){ <-convertSlots }()
+    default:
+        // Queue remains in converting state only after we can start; report queued
+        sess.State = StateQueued
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        // Try again shortly without blocking API threads
+        go func(){ time.Sleep(2 * time.Second); startConversion(sess, startTime, endTime) }()
+        return
+    }
     sess.State = StateConverting
     sess.UpdatedAt = time.Now()
     sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()

@@ -57,6 +57,10 @@ var (
         sync.RWMutex
         m map[string]*ConversionSession
     }{m: make(map[string]*ConversionSession)}
+
+    // Concurrency limiters for session-based prepare/convert flows
+    downloadSlots chan struct{}
+    convertSlots  chan struct{}
 )
 
 // Waiters notified when a job reaches a terminal state (completed or failed).

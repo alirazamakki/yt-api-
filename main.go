@@ -27,6 +27,10 @@ func main() {
         go startWorker(i)
     }
 
+    // Init concurrency semaphores for session-based flow (defaults derived from worker pool)
+    if downloadSlots == nil { downloadSlots = make(chan struct{}, MaxConcurrentDownloads) }
+    if convertSlots == nil { convertSlots = make(chan struct{}, MaxConcurrentConversions) }
+
     // Background routines
     go startHealthCheck()
     go startJobCleanup()
