@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Audio API Demo</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .container { background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 10px 0; }
+        input[type="text"] { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; }
+        button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 4px; }
+        .status.info { background: #d1ecf1; color: #0c5460; }
+        .status.success { background: #d4edda; color: #155724; }
+        .status.error { background: #f8d7da; color: #721c24; }
+        .metadata { background: white; padding: 15px; border-radius: 4px; margin: 10px 0; }
+        .progress { width: 100%; height: 20px; background: #e9ecef; border-radius: 10px; overflow: hidden; }
+        .progress-bar { height: 100%; background: #28a745; transition: width 0.3s; }
+    </style>
+</head>
+<body>
+    <h1>YouTube Audio API Demo</h1>
+    
+    <div class="container">
+        <h2>Fast Metadata + Background Processing</h2>
+        <input type="text" id="urlInput" placeholder="Enter YouTube URL" value="https://www.youtube.com/watch?v=dQw4w9WgXcQ">
+        <button onclick="startProcess()">Get Metadata & Start Download</button>
+        
+        <div id="metadata" class="metadata" style="display: none;">
+            <h3>Metadata</h3>
+            <div id="metadataContent"></div>
+        </div>
+        
+        <div id="status" class="status info" style="display: none;">
+            <div id="statusText">Processing...</div>
+            <div class="progress" id="progressContainer" style="display: none;">
+                <div class="progress-bar" id="progressBar" style="width: 0%;"></div>
+            </div>
+        </div>
+        
+        <div id="downloadSection" style="display: none;">
+            <h3>Audio Conversion</h3>
+            <label>Quality: </label>
+            <select id="qualitySelect">
+                <option value="128">128 kbps</option>
+                <option value="192">192 kbps</option>
+                <option value="256">256 kbps</option>
+                <option value="320" selected>320 kbps</option>
+            </select>
+            <button onclick="convertAudio()" id="convertBtn" disabled>Convert to MP3</button>
+            <button onclick="downloadAudio()" id="downloadBtn" disabled>Download MP3</button>
+        </div>
+    </div>
+
+    <script>
+        let currentSessionId = null;
+        let pollInterval = null;
+
+        async function startProcess() {
+            const url = document.getElementById('urlInput').value;
+            if (!url) {
+                alert('Please enter a YouTube URL');
+                return;
+            }
+
+            try {
+                const response = await fetch('/metadata', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: url })
+                });
+
+                const data = await response.json();
+                
+                if (response.ok) {
+                    currentSessionId = data.session_id;
+                    displayMetadata(data.metadata);
+                    showStatus('Metadata received. Downloading audio...', 'info');
+                    startPolling();
+                } else {
+                    showStatus('Error: ' + data.error, 'error');
+                }
+            } catch (error) {
+                showStatus('Error: ' + error.message, 'error');
+            }
+        }
+
+        function displayMetadata(metadata) {
+            const metadataDiv = document.getElementById('metadata');
+            const contentDiv = document.getElementById('metadataContent');
+            
+            contentDiv.innerHTML = `
+                <p><strong>Title:</strong> ${metadata.title || 'N/A'}</p>
+                <p><strong>Channel:</strong> ${metadata.channel || 'N/A'}</p>
+                <p><strong>Duration:</strong> ${formatDuration(metadata.duration)}</p>
+                <p><strong>Thumbnail:</strong> <img src="${metadata.thumbnail}" style="max-width: 200px; height: auto;"></p>
+            `;
+            
+            metadataDiv.style.display = 'block';
+            document.getElementById('downloadSection').style.display = 'block';
+        }
+
+        function formatDuration(seconds) {
+            if (!seconds) return 'N/A';
+            const mins = Math.floor(seconds / 60);
+            const secs = seconds % 60;
+            return `${mins}:${secs.toString().padStart(2, '0')}`;
+        }
+
+        function showStatus(message, type) {
+            const statusDiv = document.getElementById('status');
+            const statusText = document.getElementById('statusText');
+            
+            statusText.textContent = message;
+            statusDiv.className = `status ${type}`;
+            statusDiv.style.display = 'block';
+        }
+
+        function updateProgress(progress) {
+            const progressContainer = document.getElementById('progressContainer');
+            const progressBar = document.getElementById('progressBar');
+            
+            if (progress >= 0) {
+                progressContainer.style.display = 'block';
+                progressBar.style.width = progress + '%';
+            } else {
+                progressContainer.style.display = 'none';
+            }
+        }
+
+        function startPolling() {
+            if (pollInterval) clearInterval(pollInterval);
+            
+            pollInterval = setInterval(async () => {
+                try {
+                    const response = await fetch(`/status/${currentSessionId}`);
+                    const data = await response.json();
+                    
+                    if (response.ok) {
+                        handleStatusUpdate(data);
+                    } else {
+                        showStatus('Error checking status: ' + data.error, 'error');
+                        clearInterval(pollInterval);
+                    }
+                } catch (error) {
+                    showStatus('Error: ' + error.message, 'error');
+                    clearInterval(pollInterval);
+                }
+            }, 2000);
+        }
+
+        function handleStatusUpdate(data) {
+            const status = data.status;
+            
+            switch (status) {
+                case 'downloading':
+                    showStatus('Downloading audio...', 'info');
+                    updateProgress(data.download_progress || 0);
+                    break;
+                    
+                case 'downloaded':
+                    showStatus('Audio downloaded. Ready for conversion.', 'success');
+                    updateProgress(-1);
+                    document.getElementById('convertBtn').disabled = false;
+                    clearInterval(pollInterval);
+                    break;
+                    
+                case 'converting':
+                    showStatus('Converting to MP3...', 'info');
+                    updateProgress(data.conversion_progress || 0);
+                    break;
+                    
+                case 'completed':
+                    showStatus('Conversion completed! Ready for download.', 'success');
+                    updateProgress(-1);
+                    document.getElementById('downloadBtn').disabled = false;
+                    clearInterval(pollInterval);
+                    break;
+                    
+                case 'failed':
+                    showStatus('Error: ' + (data.error || 'Unknown error'), 'error');
+                    updateProgress(-1);
+                    clearInterval(pollInterval);
+                    break;
+                    
+                default:
+                    showStatus('Status: ' + status, 'info');
+            }
+        }
+
+        async function convertAudio() {
+            if (!currentSessionId) return;
+            
+            const quality = document.getElementById('qualitySelect').value;
+            
+            try {
+                const response = await fetch('/convert-audio', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        conversion_id: currentSessionId,
+                        quality: quality
+                    })
+                });
+
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showStatus('Conversion started...', 'info');
+                    document.getElementById('convertBtn').disabled = true;
+                    startPolling();
+                } else {
+                    showStatus('Error: ' + data.error, 'error');
+                }
+            } catch (error) {
+                showStatus('Error: ' + error.message, 'error');
+            }
+        }
+
+        function downloadAudio() {
+            if (currentSessionId) {
+                window.open(`/download/${currentSessionId}.mp3`, '_blank');
+            }
+        }
+    </script>
+</body>
+</html>

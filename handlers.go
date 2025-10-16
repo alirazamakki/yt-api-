@@ -165,6 +165,62 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
     }
 }
 
+// POST /metadata
+// Fast metadata endpoint that returns basic info within 1-2 seconds and starts background download
+func handleMetadata(w http.ResponseWriter, r *http.Request) {
+    enableCORS(w, r)
+    if r.Method == http.MethodOptions { w.WriteHeader(http.StatusOK); return }
+    if r.Method != http.MethodPost { http.Error(w, "Invalid request method", http.StatusMethodNotAllowed); return }
+
+    var req PrepareRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil { http.Error(w, "Invalid JSON", http.StatusBadRequest); return }
+    if req.URL == "" || !isValidYouTubeURL(req.URL) { http.Error(w, "Invalid YouTube URL", http.StatusBadRequest); return }
+
+    // Canonicalize URL
+    if canon, ok := canonicalizeYouTubeURL(req.URL); ok { req.URL = canon }
+
+    // Generate unique session ID
+    sessionID := "meta_" + uuid.New().String()
+    
+    // Create session for tracking
+    sess := &ConversionSession{ 
+        ID: sessionID, 
+        URL: req.URL, 
+        State: StateFetching, 
+        CreatedAt: time.Now(), 
+        UpdatedAt: time.Now(), 
+        LastActivityAt: time.Now(),
+    }
+
+    // Fetch metadata via OEmbed + duration API (fast)
+    meta := MetaLite{}
+    title, author, thumb := fetchOEmbedMeta(req.URL)
+    durSec := fetchDurationSeconds(req.URL)
+    meta.Title = title
+    meta.Channel = author
+    meta.Duration = durSec
+    meta.Thumbnail = thumb
+    sess.Meta = meta
+
+    // Update session state
+    sess.State = StateCreated
+    sess.UpdatedAt = time.Now()
+    saveSession(sess)
+
+    // Start background download immediately (non-blocking)
+    go startBackgroundDownload(sess)
+
+    // Return fast response with metadata
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "session_id": sessionID,
+        "status": "metadata_ready",
+        "metadata": meta,
+        "message": "Metadata fetched. Audio is downloading in background.",
+        "check_status_endpoint": fmt.Sprintf("http://localhost:8080/status/%s", sessionID),
+    })
+}
+
 // POST /prepare
 // Fetches basic metadata without yt-dlp and starts a background download of best audio
 func handlePrepare(w http.ResponseWriter, r *http.Request) {
@@ -205,6 +261,50 @@ func handlePrepare(w http.ResponseWriter, r *http.Request) {
         Status: string(StateCreated),
         Metadata: meta,
         Message: "Metadata fetched successfully. Stream is downloading in background.",
+    })
+}
+
+// POST /convert-audio
+// Convert the downloaded audio to MP3 with specified quality and optional trimming
+func handleConvertAudio(w http.ResponseWriter, r *http.Request) {
+    enableCORS(w, r)
+    if r.Method == http.MethodOptions { w.WriteHeader(http.StatusOK); return }
+    if r.Method != http.MethodPost { http.Error(w, "Invalid request method", http.StatusMethodNotAllowed); return }
+
+    var req ConvertRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil { http.Error(w, "Invalid JSON", http.StatusBadRequest); return }
+    if req.ConversionID == "" { http.Error(w, "Missing conversion_id", http.StatusBadRequest); return }
+    if req.Quality == "" { req.Quality = Quality320 }
+
+    sess, ok := getSession(req.ConversionID)
+    if !ok || sess == nil { http.Error(w, "Session not found", http.StatusNotFound); return }
+
+    // Check if audio is downloaded and ready
+    if sess.State != StateDownloaded {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "session_id": sess.ID,
+            "status": string(sess.State),
+            "message": "Audio not ready for conversion yet",
+        })
+        return
+    }
+
+    // Start conversion
+    sess.Quality = req.Quality
+    sess.RequestedStart = req.StartTime
+    sess.RequestedEnd = req.EndTime
+    sess.LastActivityAt = time.Now()
+    sess.UpdatedAt = time.Now()
+    saveSession(sess)
+
+    go startConversion(sess, req.StartTime, req.EndTime)
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "session_id": sess.ID,
+        "status": "converting",
+        "message": "Conversion started",
     })
 }
 
@@ -291,9 +391,20 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
     if sess, ok := sessions.m[jobID]; ok && sess != nil {
         sessions.RUnlock()
         resp := map[string]interface{}{
-            "conversion_id": sess.ID,
+            "session_id": sess.ID,
             "status": string(sess.State),
         }
+        
+        // Add metadata if available
+        if sess.Meta.Title != "" {
+            resp["metadata"] = map[string]interface{}{
+                "title": sess.Meta.Title,
+                "channel": sess.Meta.Channel,
+                "duration": sess.Meta.Duration,
+                "thumbnail": sess.Meta.Thumbnail,
+            }
+        }
+        
         if sess.State == StateDownloading {
             resp["download_progress"] = sess.DownloadProgress
         }
@@ -302,10 +413,11 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
         }
         if sess.State == StateCompleted && sess.OutputPath != "" {
             resp["download_url"] = fmt.Sprintf("http://localhost:8080/download/%s.mp3", sess.ID)
-            resp["metadata"] = map[string]interface{}{
-                "title": sess.Meta.Title,
-                "duration": sess.Meta.Duration,
-                "quality": string(sess.Quality),
+            if resp["metadata"] == nil {
+                resp["metadata"] = map[string]interface{}{}
+            }
+            if metadata, ok := resp["metadata"].(map[string]interface{}); ok {
+                metadata["quality"] = string(sess.Quality)
             }
         }
         w.Header().Set("Content-Type", "application/json")
@@ -366,41 +478,49 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 
     // New conversion session path
     sessions.RLock()
-    if sess, ok := sessions.m[jobID]; ok && sess != nil && sess.State == StateCompleted && sess.OutputPath != "" {
-        path := sess.OutputPath
-        sessions.RUnlock()
-        file, err := os.Open(path)
-        if err != nil {
-            http.Error(w, "Error opening file", http.StatusInternalServerError)
-            return
-        }
-        defer file.Close()
+    if sess, ok := sessions.m[jobID]; ok && sess != nil {
+        // Check if we have a completed conversion
+        if sess.State == StateCompleted && sess.OutputPath != "" {
+            path := sess.OutputPath
+            sessions.RUnlock()
+            file, err := os.Open(path)
+            if err != nil {
+                http.Error(w, "Error opening file", http.StatusInternalServerError)
+                return
+            }
+            defer file.Close()
 
-        fi, _ := file.Stat()
-        size := fi.Size()
-        w.Header().Set("Accept-Ranges", "bytes")
-        w.Header().Set("Content-Type", "audio/mpeg")
-        w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filenameWithExt))
-        w.Header().Set("Cache-Control", "public, max-age=3600")
+            fi, _ := file.Stat()
+            size := fi.Size()
+            w.Header().Set("Accept-Ranges", "bytes")
+            w.Header().Set("Content-Type", "audio/mpeg")
+            w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filenameWithExt))
+            w.Header().Set("Cache-Control", "public, max-age=3600")
 
-        if rng := r.Header.Get("Range"); rng != "" {
-            if strings.HasPrefix(rng, "bytes=") {
-                parts := strings.TrimPrefix(rng, "bytes=")
-                if strings.HasSuffix(parts, "-") {
-                    startStr := strings.TrimSuffix(parts, "-")
-                    if start, err := strconv.ParseInt(startStr, 10, 64); err == nil && start < size {
-                        w.WriteHeader(http.StatusPartialContent)
-                        w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, size-1, size))
-                        file.Seek(start, 0)
-                        io.Copy(w, file)
-                        return
+            if rng := r.Header.Get("Range"); rng != "" {
+                if strings.HasPrefix(rng, "bytes=") {
+                    parts := strings.TrimPrefix(rng, "bytes=")
+                    if strings.HasSuffix(parts, "-") {
+                        startStr := strings.TrimSuffix(parts, "-")
+                        if start, err := strconv.ParseInt(startStr, 10, 64); err == nil && start < size {
+                            w.WriteHeader(http.StatusPartialContent)
+                            w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, size-1, size))
+                            file.Seek(start, 0)
+                            io.Copy(w, file)
+                            return
+                        }
                     }
                 }
             }
+            w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
+            io.Copy(w, file)
+            return
+        } else {
+            // Session exists but not ready for download
+            sessions.RUnlock()
+            http.Error(w, "File not ready for download", http.StatusNotFound)
+            return
         }
-        w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-        io.Copy(w, file)
-        return
     }
     sessions.RUnlock()
 
@@ -497,8 +617,10 @@ func handleDocs(w http.ResponseWriter, r *http.Request) {
     <h2>Endpoints</h2>
     <ul>
       <li><code>POST /extract</code> - Start conversion. Body: { url, idempotency_key?, callback_url? }</li>
-      <li><code>GET /status/{job_id}</code> - Check job status.</li>
-      <li><code>GET /download/{job_id}.mp3</code> - Download MP3 (Range supported).</li>
+      <li><code>POST /metadata</code> - Fast metadata + background download. Body: { url }</li>
+      <li><code>POST /convert-audio</code> - Convert downloaded audio. Body: { conversion_id, quality?, start_time?, end_time? }</li>
+      <li><code>GET /status/{session_id}</code> - Check session status.</li>
+      <li><code>GET /download/{session_id}.mp3</code> - Download MP3 (Range supported).</li>
       <li><code>GET /health</code>, <code>/metrics</code>, <code>/stats</code> - Monitoring.</li>
     </ul>
     <h2>Auth</h2>
@@ -519,11 +641,43 @@ func handleDocsFrontend(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Content-Type", "text/html; charset=utf-8")
     io.WriteString(w, `<!doctype html><html><head><meta charset="utf-8"><title>Frontend Integration</title><style>body{font-family:sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;}</style></head><body>
     <h1>Frontend Integration</h1>
-    <p>Use fetch with CORS. Example:</p>
-    <pre><code>fetch('/extract',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':'YOUR_KEY'},body:JSON.stringify({url})})
+    <p>Use fetch with CORS. For fast metadata + background processing:</p>
+    <pre><code>// Step 1: Get metadata and start background download
+fetch('/metadata',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':'YOUR_KEY'},body:JSON.stringify({url})})
  .then(r=>r.json())
- .then(({job_id})=>pollStatus(job_id))</code></pre>
-    <p>Poll status every few seconds. When status = completed, navigate to <code>/download/{job_id}.mp3</code>.</p>
+ .then(({session_id,metadata})=>{
+   console.log('Metadata:', metadata);
+   return pollStatus(session_id);
+ })
+
+// Step 2: Poll status until downloaded
+function pollStatus(sessionId) {
+  return fetch('/status/' + sessionId)
+   .then(r=>r.json())
+   .then(data=>{
+     if(data.status==='downloaded') {
+       // Step 3: Convert to MP3
+       return fetch('/convert-audio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conversion_id:sessionId,quality:'320'})})
+        .then(r=>r.json())
+        .then(()=>pollConversionStatus(sessionId));
+     }
+     return new Promise(resolve=>setTimeout(()=>resolve(pollStatus(sessionId)), 2000));
+   });
+}
+
+// Step 4: Poll conversion status
+function pollConversionStatus(sessionId) {
+  return fetch('/status/' + sessionId)
+   .then(r=>r.json())
+   .then(data=>{
+     if(data.status==='completed') {
+       window.location.href = '/download/' + sessionId + '.mp3';
+     } else {
+       setTimeout(()=>pollConversionStatus(sessionId), 2000);
+     }
+   });
+}</code></pre>
+    <p>For simple one-step conversion, use <code>/extract</code> endpoint.</p>
     </body></html>`)
 }
 
