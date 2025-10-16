@@ -39,6 +39,7 @@ func main() {
     // Setup HTTP routes with middleware
     mux := http.NewServeMux()
     mux.HandleFunc("/extract", rateLimitMiddleware(apiKeyMiddleware(handleExtract)))
+    mux.HandleFunc("/metadata", rateLimitMiddleware(apiKeyMiddleware(handleMetadata)))
     mux.HandleFunc("/prepare", rateLimitMiddleware(apiKeyMiddleware(handlePrepare)))
     mux.HandleFunc("/convert", rateLimitMiddleware(apiKeyMiddleware(handleConvert)))
     mux.HandleFunc("/status/", rateLimitMiddleware(apiKeyMiddleware(handleStatus)))

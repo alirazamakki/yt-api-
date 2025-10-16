@@ -389,6 +389,141 @@ func convertToMP3WithProgress(sess *ConversionSession, srcPath, outPath, startTi
     return nil
 }
 
+// Background audio download and conversion for metadata endpoint
+func startBackgroundAudioDownload(sess *ConversionSession) {
+    if sess == nil { return }
+    
+    // Acquire download slot
+    select {
+    case downloadSlots <- struct{}{}:
+        defer func(){ <-downloadSlots }()
+    default:
+        sess.State = StateFailed
+        sess.Error = "server busy; too many concurrent downloads"
+        sess.UpdatedAt = time.Now()
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        return
+    }
+    
+    sess.State = StateDownloading
+    sess.UpdatedAt = time.Now()
+    sess.LastActivityAt = time.Now()
+    sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+
+    _ = os.MkdirAll(ConversionsDir, 0o755)
+    basePath := filepath.Join(ConversionsDir, sess.ID)
+
+    // Use yt-dlp to download best audio format
+    tmpNoExt := basePath
+    if err := startYTDLPDownloadWithProgress(sess, tmpNoExt); err != nil {
+        sess.State = StateFailed
+        sess.Error = err.Error()
+        sess.UpdatedAt = time.Now()
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        return
+    }
+    
+    // Find the downloaded file
+    var srcPath string
+    for _, ext := range []string{"m4a","webm","mp4","opus","ogg"} {
+        p := tmpNoExt + "." + ext
+        if _, err := os.Stat(p); err == nil { 
+            srcPath = p; 
+            sess.SourceExt = ext; 
+            break 
+        }
+    }
+    if srcPath == "" { 
+        sess.State = StateFailed
+        sess.Error = "downloaded file not found"
+        sess.UpdatedAt = time.Now()
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        return
+    }
+    
+    sess.SourcePath = srcPath
+    sess.State = StateDownloaded
+    sess.UpdatedAt = time.Now()
+    sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+    
+    // Convert to MP3 using FFmpeg
+    go convertDownloadedAudio(sess)
+}
+
+// Convert downloaded audio to MP3
+func convertDownloadedAudio(sess *ConversionSession) {
+    if sess == nil || sess.SourcePath == "" { return }
+    
+    // Acquire conversion slot
+    select {
+    case convertSlots <- struct{}{}:
+        defer func(){ <-convertSlots }()
+    default:
+        sess.State = StateQueued
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        // Retry after delay
+        go func(){ time.Sleep(2 * time.Second); convertDownloadedAudio(sess) }()
+        return
+    }
+    
+    sess.State = StateConverting
+    sess.UpdatedAt = time.Now()
+    sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+
+    // Convert to MP3
+    outPath := filepath.Join(ConversionsDir, sess.ID+".mp3")
+    var timeout time.Duration = FFmpegMinTimeout
+    if sess.Meta.Duration > 0 {
+        d := time.Duration(sess.Meta.Duration) * time.Second
+        calc := d*2 + 3*time.Minute
+        if calc > timeout { timeout = calc }
+        if timeout > FFmpegMaxTimeout { timeout = FFmpegMaxTimeout }
+    }
+
+    // Use default quality (192k CBR)
+    prevCBR := FFmpegCBRBitrate
+    FFmpegCBRBitrate = "192k"
+    
+    err := convertToMP3WithProgress(sess, sess.SourcePath, outPath, "", "", timeout)
+    
+    // Restore global bitrate
+    FFmpegCBRBitrate = prevCBR
+
+    if err == nil && fileExists(outPath) {
+        sess.OutputPath = outPath
+        sess.State = StateCompleted
+        sess.ConversionsCount++
+        sess.UpdatedAt = time.Now()
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        
+        // Schedule deletion after TTL
+        go func(id, path string){
+            time.Sleep(ConvertedFileTTL)
+            _ = os.Remove(path)
+            sessions.Lock()
+            if s, ok := sessions.m[id]; ok && s != nil && s.OutputPath == path { 
+                s.OutputPath = "" 
+            }
+            sessions.Unlock()
+        }(sess.ID, outPath)
+    } else {
+        sess.State = StateFailed
+        if err != nil {
+            sess.Error = err.Error()
+        } else {
+            sess.Error = "ffmpeg conversion failed"
+        }
+        sess.UpdatedAt = time.Now()
+        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+    }
+}
+
+// Helper function to check if file exists
+func fileExists(path string) bool {
+    _, err := os.Stat(path)
+    return err == nil
+}
+
 // Background download using yt-dlp bestaudio to ConversionsDir/{id}.{ext}
 func startBackgroundDownload(sess *ConversionSession) {
     if sess == nil { return }
