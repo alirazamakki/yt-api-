@@ -180,9 +180,10 @@ func handlePrepare(w http.ResponseWriter, r *http.Request) {
     if canon, ok := canonicalizeYouTubeURL(req.URL); ok { req.URL = canon }
 
     convID := "conv_" + uuid.New().String()
-    sess := &ConversionSession{ ID: convID, URL: req.URL, State: StateCreated, CreatedAt: time.Now(), UpdatedAt: time.Now(), LastActivityAt: time.Now() }
+    sess := &ConversionSession{ ID: convID, URL: req.URL, State: StatePreparing, CreatedAt: time.Now(), UpdatedAt: time.Now(), LastActivityAt: time.Now() }
 
     // Fetch metadata via OEmbed + duration API
+    sess.State = StateFetching
     meta := MetaLite{}
     title, author, thumb := fetchOEmbedMeta(req.URL)
     durSec := fetchDurationSeconds(req.URL)
@@ -192,10 +193,10 @@ func handlePrepare(w http.ResponseWriter, r *http.Request) {
     meta.Thumbnail = thumb
     sess.Meta = meta
 
-    // Persist
-    sessions.Lock(); sessions.m[convID] = sess; sessions.Unlock()
+    // Persist (in-memory + Redis if available)
+    saveSession(sess)
 
-    // Start background download
+    // Start background download with progress piping
     go startBackgroundDownload(sess)
 
     w.Header().Set("Content-Type", "application/json")
@@ -218,7 +219,7 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
     if req.ConversionID == "" { http.Error(w, "Missing conversion_id", http.StatusBadRequest); return }
     if req.Quality == "" { req.Quality = Quality320 }
 
-    sessions.RLock(); sess, ok := sessions.m[req.ConversionID]; sessions.RUnlock()
+    sess, ok := getSession(req.ConversionID)
     if !ok || sess == nil { http.Error(w, "Conversion not found", http.StatusNotFound); return }
 
     // Enforce per-ID conversion limit
@@ -238,7 +239,7 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
         sess.RequestedStart = req.StartTime
         sess.RequestedEnd = req.EndTime
         sess.UpdatedAt = time.Now()
-        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        saveSession(sess)
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(map[string]interface{}{
             "conversion_id": sess.ID,
@@ -253,7 +254,7 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
         go startConversion(sess, req.StartTime, req.EndTime)
         sess.State = StateConverting
         sess.UpdatedAt = time.Now()
-        sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+        saveSession(sess)
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(map[string]interface{}{
             "conversion_id": sess.ID,

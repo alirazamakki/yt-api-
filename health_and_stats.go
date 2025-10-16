@@ -109,6 +109,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
         if sess.OutputPath != "" { _ = os.Remove(sess.OutputPath); sess.OutputPath = "" }
         if sess.SourcePath != "" { _ = os.Remove(sess.SourcePath); sess.SourcePath = "" }
         delete(sessions.m, jobID)
+        deleteSessionFromRedis(jobID)
         sessions.Unlock()
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "message": "Conversion data removed successfully."})

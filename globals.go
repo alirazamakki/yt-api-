@@ -61,6 +61,10 @@ var (
     // Concurrency limiters for session-based prepare/convert flows
     downloadSlots chan struct{}
     convertSlots  chan struct{}
+
+    // Circuit breakers for external metadata endpoints
+    oembedBreaker   = NewCircuitBreaker(5, 30*time.Second)
+    durationBreaker = NewCircuitBreaker(5, 30*time.Second)
 )
 
 // Waiters notified when a job reaches a terminal state (completed or failed).

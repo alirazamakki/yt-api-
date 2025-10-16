@@ -49,6 +49,8 @@ type ConvertRequest struct {
 type ConversionState string
 
 const (
+    StatePreparing  ConversionState = "preparing"
+    StateFetching   ConversionState = "fetching_metadata"
     StateCreated     ConversionState = "created"
     StateDownloading ConversionState = "downloading"
     StateDownloaded  ConversionState = "downloaded"
