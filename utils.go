@@ -429,26 +429,11 @@ func startBackgroundDownload(sess *ConversionSession) {
     }
     if srcPath == "" { srcPath = tmpNoExt + ".m4a" }
     sess.SourcePath = srcPath
-    // If a convert was queued meanwhile, kick it off
-    queued := false
-    sessions.Lock()
-    if s, ok := sessions.m[sess.ID]; ok && s != nil && s.State == StateQueued {
-        queued = true
-        s.State = StateDownloaded
-        s.SourcePath = sess.SourcePath
-        s.SourceExt = sess.SourceExt
-        s.UpdatedAt = time.Now()
-        sessions.m[sess.ID] = s
-        sess = s
-    } else {
-        sess.State = StateDownloaded
-        sess.UpdatedAt = time.Now()
-        sessions.m[sess.ID] = sess
-    }
-    sessions.Unlock()
-    if queued {
-        go startConversion(sess, sess.RequestedStart, sess.RequestedEnd)
-    }
+    sess.State = StateDownloaded
+    sess.UpdatedAt = time.Now()
+    sessions.Lock(); sessions.m[sess.ID] = sess; sessions.Unlock()
+    
+    logInfof("background_download_completed session_id=%s source_path=%s", sess.ID, srcPath)
 }
 
 // Start ffmpeg conversion to MP3 with optional trimming and quality
