@@ -1,164 +1,105 @@
 package main
 
 import (
-    "encoding/json"
-    "fmt"
-    "log"
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
 
-    redis "github.com/redis/go-redis/v9"
-    xxhash "github.com/cespare/xxhash/v2"
+	"github.com/redis/go-redis/v9"
 )
 
+var (
+	redisClient *redis.Client
+	ctx         = context.Background()
+)
+
+// initRedis initializes Redis connection
 func initRedis() {
-    redisClient = redis.NewClient(&redis.Options{
-        Addr:     RedisAddr,
-        Password: RedisPassword,
-        DB:       RedisDB,
-    })
-    if _, err := redisClient.Ping(ctx).Result(); err != nil {
-        log.Printf("⚠️  Redis not available, using in-memory storage: %v", err)
-        redisClient = nil
-    } else {
-        log.Println("✅ Redis connected successfully")
-    }
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:     RedisAddr,
+		Password: RedisPassword,
+		DB:       RedisDB,
+	})
+
+	// Test connection
+	_, err := redisClient.Ping(ctx).Result()
+	if err != nil {
+		fmt.Printf("Redis connection failed: %v\n", err)
+		redisClient = nil
+	} else {
+		fmt.Println("Redis connected successfully")
+	}
 }
 
-func saveJobToRedis(job *ConversionJob) error {
-    if redisClient == nil {
-        return nil
-    }
-    jobData, err := json.Marshal(job)
-    if err != nil {
-        return err
-    }
-    key := fmt.Sprintf("job:%s", job.ID)
-    expiration := JobExpiration
-    return redisClient.Set(ctx, key, jobData, expiration).Err()
+// saveSession saves a conversion session to Redis
+func saveSession(session *ConversionSession) error {
+	if redisClient == nil {
+		return nil // Redis not available, skip
+	}
+
+	data, err := json.Marshal(session)
+	if err != nil {
+		return err
+	}
+
+	key := fmt.Sprintf("session:%s", session.ID)
+	return redisClient.Set(ctx, key, data, JobExpiration).Err()
 }
 
-func getJobFromRedis(jobID string) (*ConversionJob, error) {
-    if redisClient == nil {
-        return nil, nil
-    }
-    key := fmt.Sprintf("job:%s", jobID)
-    val, err := redisClient.Get(ctx, key).Result()
-    if err != nil {
-        return nil, err
-    }
-    var job ConversionJob
-    if err := json.Unmarshal([]byte(val), &job); err != nil {
-        return nil, err
-    }
-    return &job, nil
+// getSession retrieves a conversion session from Redis
+func getSession(sessionID string) (*ConversionSession, error) {
+	if redisClient == nil {
+		return nil, fmt.Errorf("Redis not available")
+	}
+
+	key := fmt.Sprintf("session:%s", sessionID)
+	data, err := redisClient.Get(ctx, key).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var session ConversionSession
+	err = json.Unmarshal([]byte(data), &session)
+	return &session, err
 }
 
-// URL mapping for deduplication across restarts
-func saveURLMapping(videoURL, jobID string) error {
-    if redisClient == nil {
-        return nil
-    }
-    key := fmt.Sprintf("url:%x", xxhashString(videoURL))
-    expiration := JobExpiration
-    return redisClient.Set(ctx, key, jobID, expiration).Err()
+// deleteSessionFromRedis deletes a session from Redis
+func deleteSessionFromRedis(sessionID string) error {
+	if redisClient == nil {
+		return nil
+	}
+
+	key := fmt.Sprintf("session:%s", sessionID)
+	return redisClient.Del(ctx, key).Err()
 }
 
-func getJobIDByURL(videoURL string) (string, error) {
-    if redisClient == nil {
-        return "", nil
-    }
-    key := fmt.Sprintf("url:%x", xxhashString(videoURL))
-    return redisClient.Get(ctx, key).Result()
+// saveURLMapping saves URL to session ID mapping
+func saveURLMapping(url, sessionID string) error {
+	if redisClient == nil {
+		return nil
+	}
+
+	key := fmt.Sprintf("url:%s", url)
+	return redisClient.Set(ctx, key, sessionID, JobExpiration).Err()
 }
 
-func removeURLMapping(videoURL string) {
-    if redisClient == nil {
-        return
-    }
-    key := fmt.Sprintf("url:%x", xxhashString(videoURL))
-    _ = redisClient.Del(ctx, key).Err()
+// getSessionIDByURL retrieves session ID by URL
+func getSessionIDByURL(url string) (string, error) {
+	if redisClient == nil {
+		return "", fmt.Errorf("Redis not available")
+	}
+
+	key := fmt.Sprintf("url:%s", url)
+	return redisClient.Get(ctx, key).Result()
 }
 
-func deleteJobFromRedis(jobID string) {
-    if redisClient == nil {
-        return
-    }
-    key := fmt.Sprintf("job:%s", jobID)
-    _ = redisClient.Del(ctx, key).Err()
-}
+// removeURLMapping removes URL mapping
+func removeURLMapping(url string) error {
+	if redisClient == nil {
+		return nil
+	}
 
-// Session store (prepare/convert flow)
-func saveSessionToRedis(sess *ConversionSession) error {
-    if redisClient == nil || sess == nil {
-        return nil
-    }
-    key := fmt.Sprintf("sess:%s", sess.ID)
-    data, err := json.Marshal(sess)
-    if err != nil { return err }
-    return redisClient.Set(ctx, key, data, JobExpiration).Err()
-}
-
-func getSessionFromRedis(id string) (*ConversionSession, error) {
-    if redisClient == nil {
-        return nil, nil
-    }
-    key := fmt.Sprintf("sess:%s", id)
-    val, err := redisClient.Get(ctx, key).Result()
-    if err != nil { return nil, err }
-    var s ConversionSession
-    if err := json.Unmarshal([]byte(val), &s); err != nil { return nil, err }
-    return &s, nil
-}
-
-func deleteSessionFromRedis(id string) {
-    if redisClient == nil { return }
-    key := fmt.Sprintf("sess:%s", id)
-    _ = redisClient.Del(ctx, key).Err()
-}
-
-// Combined helpers to keep in-memory and Redis in sync
-func saveSession(sess *ConversionSession) {
-    if sess == nil { return }
-    sessions.Lock()
-    sessions.m[sess.ID] = sess
-    sessions.Unlock()
-    _ = saveSessionToRedis(sess)
-}
-
-func getSession(id string) (*ConversionSession, bool) {
-    sessions.RLock()
-    s, ok := sessions.m[id]
-    sessions.RUnlock()
-    if ok && s != nil { return s, true }
-    // Try Redis
-    if rs, err := getSessionFromRedis(id); err == nil && rs != nil {
-        sessions.Lock(); sessions.m[id] = rs; sessions.Unlock()
-        return rs, true
-    }
-    return nil, false
-}
-
-func deleteSession(id string) {
-    sessions.Lock(); delete(sessions.m, id); sessions.Unlock()
-    deleteSessionFromRedis(id)
-}
-
-func xxhashString(s string) uint64 {
-    return xxhash.Sum64String(s)
-}
-
-// Idempotency key mapping
-func saveIdempotencyKey(idemKey, jobID string) error {
-    if redisClient == nil {
-        return nil
-    }
-    key := fmt.Sprintf("idem:%x", xxhashString(idemKey))
-    return redisClient.Set(ctx, key, jobID, JobExpiration).Err()
-}
-
-func getJobIDByIdempotency(idemKey string) (string, error) {
-    if redisClient == nil {
-        return "", nil
-    }
-    key := fmt.Sprintf("idem:%x", xxhashString(idemKey))
-    return redisClient.Get(ctx, key).Result()
+	key := fmt.Sprintf("url:%s", url)
+	return redisClient.Del(ctx, key).Err()
 }
